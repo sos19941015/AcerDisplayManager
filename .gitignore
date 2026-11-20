@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.dll
+*.exe
+*.pdb
+*.log
+.DS_Store
+Thumbs.db
