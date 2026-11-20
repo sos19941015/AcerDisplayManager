@@ -1,12 +1,23 @@
-use libloading::Library;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use windows::core::PCSTR;
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesA, DISPLAY_DEVICEA, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+use windows::Win32::Devices::Display::{
+    DestroyPhysicalMonitors, GetCapabilitiesStringLength, GetMonitorBrightness, GetMonitorContrast,
+    GetMonitorRedGreenOrBlueGain, GetNumberOfPhysicalMonitorsFromHMONITOR,
+    GetPhysicalMonitorsFromHMONITOR, GetVCPFeatureAndVCPFeatureReply, SetMonitorBrightness,
+    SetMonitorContrast, SetMonitorRedGreenOrBlueGain, SetVCPFeature, MC_BLUE_GAIN, MC_GAIN_TYPE,
+    MC_GREEN_GAIN, MC_RED_GAIN, PHYSICAL_MONITOR,
 };
+use windows::Win32::Foundation::{BOOL, HANDLE, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayDevicesA, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEA,
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
+
+const BANK_DELAY: Duration = Duration::from_millis(50);
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,16 +113,6 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
     result
 }
 
-type FnInitMccs = unsafe extern "C" fn(i32, *const u16, i32, i32) -> bool;
-type FnFreePhysicalMonitor = unsafe extern "C" fn();
-type FnGetRange = unsafe extern "C" fn(&mut u32, &mut u32, &mut u32) -> bool;
-type FnGetPair = unsafe extern "C" fn(&mut u32, &mut u32) -> bool;
-type FnSetU32 = unsafe extern "C" fn(u32) -> bool;
-type FnGetVcp = unsafe extern "C" fn(u8, &mut u32, &mut u32) -> bool;
-type FnSetVcp = unsafe extern "C" fn(u8, u32) -> bool;
-type FnGetSn = unsafe extern "C" fn(&mut u32, &mut u32, i32, i32) -> bool;
-type FnGetVcpString = unsafe extern "C" fn() -> *const c_char;
-
 pub const VCP_HUE: [u8; 6] = [0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E];
 pub const VCP_SAT: [u8; 6] = [0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0];
 pub const VCP_RGB_BLACK: [u8; 3] = [0x6C, 0x6E, 0x70];
@@ -185,313 +186,113 @@ pub struct SystemHwState {
     pub input_source: Option<u32>,
 }
 
+struct EnumMonCtx<'a> {
+    target_name: &'a str,
+    found: Option<HMONITOR>,
+}
+
+unsafe extern "system" fn enum_monitor_proc(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut EnumMonCtx<'_>);
+    let mut mi = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    if GetMonitorInfoW(hmon, &mut mi.monitorInfo as *mut MONITORINFO).as_bool() {
+        let end = mi
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(mi.szDevice.len());
+        let name = String::from_utf16_lossy(&mi.szDevice[..end]);
+        if name.eq_ignore_ascii_case(ctx.target_name) {
+            ctx.found = Some(hmon);
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
+}
+
+fn find_hmonitor(device_name: &str) -> Option<HMONITOR> {
+    let mut ctx = EnumMonCtx {
+        target_name: device_name,
+        found: None,
+    };
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(enum_monitor_proc),
+            LPARAM(&mut ctx as *mut EnumMonCtx<'_> as isize),
+        );
+    }
+    ctx.found
+}
+
+/// Pure Windows native DDC/CI (`dxva2.dll`) controller — zero Acer DLL dependencies.
 pub struct MccsSdk {
-    _lib: Library,
-    initialized: Cell<bool>,
-    init_mccs: FnInitMccs,
-    free_monitor: FnFreePhysicalMonitor,
-    get_vcp_string: FnGetVcpString,
-    get_vcp_code: FnGetVcp,
-    set_vcp_code: FnSetVcp,
-    get_brightness: FnGetRange,
-    set_brightness: FnSetU32,
-    get_contrast: FnGetRange,
-    set_contrast: FnSetU32,
-    get_rgain: FnGetRange,
-    set_rgain: FnSetU32,
-    get_ggain: FnGetRange,
-    set_ggain: FnSetU32,
-    get_bgain: FnGetRange,
-    set_bgain: FnSetU32,
-    get_bluelight: FnGetPair,
-    set_bluelight: FnSetU32,
-    get_gamma: FnGetPair,
-    set_gamma: FnSetU32,
-    get_colortemp: FnGetPair,
-    set_colortemp: FnSetU32,
-    get_blackboost: FnGetPair,
-    set_blackboost: FnSetU32,
-    get_volume: FnGetPair,
-    set_volume: FnSetU32,
-    get_refreshrate: FnGetPair,
-    set_refreshrate: FnSetU32,
-    get_od: FnGetPair,
-    set_od: FnSetU32,
-    get_aim_type: FnGetPair,
-    set_aim_type: FnSetU32,
-    get_pixel_refresh: FnGetPair,
-    set_pixel_refresh: FnSetU32,
-    get_pixel_shift: FnGetPair,
-    set_pixel_shift: FnSetU32,
-    get_logo_detection: FnGetPair,
-    set_logo_detection: FnSetU32,
-    get_static_image: FnGetPair,
-    set_static_image: FnSetU32,
-    get_ai_protection: FnGetPair,
-    set_ai_protection: FnSetU32,
-    set_power_mode: FnSetU32,
-    get_power_indicator: FnGetPair,
-    set_power_indicator: FnSetU32,
-    get_power_key: FnGetPair,
-    set_power_key: FnSetU32,
-    get_key_lock: FnGetPair,
-    set_key_lock: FnSetU32,
-    get_usb_port: FnGetPair,
-    set_usb_port: FnSetU32,
-    get_sn: FnGetSn,
-    get_display_mode: FnGetPair,
-    set_display_mode: FnSetU32,
+    monitors: RefCell<Vec<PHYSICAL_MONITOR>>,
 }
 
 impl MccsSdk {
-    pub fn find_and_load() -> Result<(Self, PathBuf), String> {
-        let dll_name = "Monitor_MCCS_API_x64.dll";
-        let mut candidates = vec![
-            PathBuf::from(dll_name),
-            PathBuf::from("..").join(dll_name),
-            PathBuf::from(r"C:\Program Files (x86)\Acer\Acer Display Widget").join(dll_name),
-            PathBuf::from(r"C:\Program Files\Acer\Acer Display Widget").join(dll_name),
-        ];
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.insert(0, dir.join(dll_name));
-            }
+    pub fn new() -> Self {
+        Self {
+            monitors: RefCell::new(Vec::new()),
         }
-
-        let found = candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                format!(
-                    "找不到 {dll_name}，請從官方 Acer Display Widget 安裝目錄複製此 DLL 到執行檔同目錄"
-                )
-            })?;
-
-        unsafe { Self::load(&found) }
-            .map(|sdk| (sdk, found))
-            .map_err(|e| format!("載入 {dll_name} 失敗: {e}"))
-    }
-
-    unsafe fn load(dll_path: &Path) -> Result<Self, libloading::Error> {
-        let lib = Library::new(dll_path)?;
-        Ok(Self {
-            init_mccs: *lib.get::<FnInitMccs>(b"init_MCCS\0")?,
-            free_monitor: *lib.get::<FnFreePhysicalMonitor>(b"FreePhysicalMonitor\0")?,
-            get_vcp_string: *lib.get::<FnGetVcpString>(b"Monitor_Get_VCP_String\0")?,
-            get_vcp_code: *lib.get::<FnGetVcp>(b"Monitor_Get_VCP_code\0")?,
-            set_vcp_code: *lib.get::<FnSetVcp>(b"Monitor_SET_VCP_code\0")?,
-            get_brightness: *lib.get::<FnGetRange>(b"Monitor_GET_Brightness\0")?,
-            set_brightness: *lib.get::<FnSetU32>(b"Monitor_SET_Brightness\0")?,
-            get_contrast: *lib.get::<FnGetRange>(b"Monitor_GET_Contrast\0")?,
-            set_contrast: *lib.get::<FnSetU32>(b"Monitor_SET_Contrast\0")?,
-            get_rgain: *lib.get::<FnGetRange>(b"Monitor_GET_Rgain\0")?,
-            set_rgain: *lib.get::<FnSetU32>(b"Monitor_SET_Rgain\0")?,
-            get_ggain: *lib.get::<FnGetRange>(b"Monitor_GET_Ggain\0")?,
-            set_ggain: *lib.get::<FnSetU32>(b"Monitor_SET_Ggain\0")?,
-            get_bgain: *lib.get::<FnGetRange>(b"Monitor_GET_Bgain\0")?,
-            set_bgain: *lib.get::<FnSetU32>(b"Monitor_SET_Bgain\0")?,
-            get_bluelight: *lib.get::<FnGetPair>(b"Monitor_GET_BlueLight\0")?,
-            set_bluelight: *lib.get::<FnSetU32>(b"Monitor_Set_BlueLight\0")?,
-            get_gamma: *lib.get::<FnGetPair>(b"Monitor_GET_Gamma\0")?,
-            set_gamma: *lib.get::<FnSetU32>(b"Monitor_Set_Gamma\0")?,
-            get_colortemp: *lib.get::<FnGetPair>(b"Monitor_GET_ColorTemp\0")?,
-            set_colortemp: *lib.get::<FnSetU32>(b"Monitor_Set_ColorTemp\0")?,
-            get_blackboost: *lib.get::<FnGetPair>(b"Monitor_GET_BlackBoost\0")?,
-            set_blackboost: *lib.get::<FnSetU32>(b"Monitor_Set_BlackBoost\0")?,
-            get_volume: *lib.get::<FnGetPair>(b"Monitor_GET_SPK_Volume\0")?,
-            set_volume: *lib.get::<FnSetU32>(b"Monitor_SET_SPK_Volume\0")?,
-            get_refreshrate: *lib.get::<FnGetPair>(b"Monitor_GET_RefreshRate\0")?,
-            set_refreshrate: *lib.get::<FnSetU32>(b"Monitor_Set_RefreshRate\0")?,
-            get_od: *lib.get::<FnGetPair>(b"Monitor_GET_OD\0")?,
-            set_od: *lib.get::<FnSetU32>(b"Monitor_Set_OD\0")?,
-            get_aim_type: *lib.get::<FnGetPair>(b"Monitor_GET_AimType\0")?,
-            set_aim_type: *lib.get::<FnSetU32>(b"Monitor_Set_AimType\0")?,
-            get_pixel_refresh: *lib.get::<FnGetPair>(b"Monitor_GET_ImageRetentionRefresh\0")?,
-            set_pixel_refresh: *lib.get::<FnSetU32>(b"Monitor_Set_ImageRetentionRefresh\0")?,
-            get_pixel_shift: *lib.get::<FnGetPair>(b"Monitor_GET_PixelCentering\0")?,
-            set_pixel_shift: *lib.get::<FnSetU32>(b"Monitor_Set_PixelCentering\0")?,
-            get_logo_detection: *lib.get::<FnGetPair>(b"Monitor_GET_EdgeProtection\0")?,
-            set_logo_detection: *lib.get::<FnSetU32>(b"Monitor_Set_EdgeProtection\0")?,
-            get_static_image: *lib.get::<FnGetPair>(b"Monitor_GET_StaticImageUpkeep\0")?,
-            set_static_image: *lib.get::<FnSetU32>(b"Monitor_Set_StaticImageUpkeep\0")?,
-            get_ai_protection: *lib.get::<FnGetPair>(b"Monitor_GET_AIProtection\0")?,
-            set_ai_protection: *lib.get::<FnSetU32>(b"Monitor_Set_AIProtection\0")?,
-            set_power_mode: *lib.get::<FnSetU32>(b"Monitor_Set_PowerModeControl\0")?,
-            get_power_indicator: *lib.get::<FnGetPair>(b"Monitor_GET_PowerIndicator\0")?,
-            set_power_indicator: *lib.get::<FnSetU32>(b"Monitor_Set_PowerIndicator\0")?,
-            get_power_key: *lib.get::<FnGetPair>(b"Monitor_GET_PowerKey\0")?,
-            set_power_key: *lib.get::<FnSetU32>(b"Monitor_Set_PowerKey\0")?,
-            get_key_lock: *lib.get::<FnGetPair>(b"Monitor_GET_KeyLock\0")?,
-            set_key_lock: *lib.get::<FnSetU32>(b"Monitor_Set_KeyLock\0")?,
-            get_usb_port: *lib.get::<FnGetPair>(b"Monitor_Get_USBPortSelect\0")?,
-            set_usb_port: *lib.get::<FnSetU32>(b"Monitor_Set_USBPortSelect\0")?,
-            get_sn: *lib.get::<FnGetSn>(b"Monitor_Get_SN\0")?,
-            get_display_mode: *lib.get::<FnGetPair>(b"Monitor_GET_DisplayMode\0")?,
-            set_display_mode: *lib.get::<FnSetU32>(b"Monitor_Set_DisplayMode\0")?,
-            initialized: Cell::new(false),
-            _lib: lib,
-        })
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.initialized.get()
+        !self.monitors.borrow().is_empty()
     }
 
-    pub fn init(&self, monitor_index: i32, device_name: &str) -> bool {
+    fn handle(&self) -> Option<HANDLE> {
+        self.monitors
+            .borrow()
+            .first()
+            .map(|m| m.hPhysicalMonitor)
+    }
+
+    pub fn init(&self, _monitor_index: i32, device_name: &str) -> bool {
         self.free();
-        let wide_name: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let ok = unsafe { (self.init_mccs)(monitor_index, wide_name.as_ptr(), 0, 0) };
-        self.initialized.set(ok);
-        ok
+        let Some(hmon) = find_hmonitor(device_name) else {
+            return false;
+        };
+        let mut count = 0u32;
+        if unsafe { GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &mut count) }.is_err()
+            || count == 0
+        {
+            return false;
+        }
+        let mut mons = vec![PHYSICAL_MONITOR::default(); count as usize];
+        if unsafe { GetPhysicalMonitorsFromHMONITOR(hmon, &mut mons) }.is_err() {
+            return false;
+        }
+        *self.monitors.borrow_mut() = mons;
+        true
     }
 
     pub fn free(&self) {
-        if self.initialized.replace(false) {
-            unsafe { (self.free_monitor)() };
+        let mut mons = self.monitors.borrow_mut();
+        if !mons.is_empty() {
+            let _ = unsafe { DestroyPhysicalMonitors(&mons) };
+            mons.clear();
         }
-    }
-
-    fn read_range(&self, f: FnGetRange) -> Option<(u32, u32, u32)> {
-        if !self.initialized.get() {
-            return None;
-        }
-        let (mut min, mut cur, mut max) = (0, 0, 0);
-        if unsafe { f(&mut min, &mut cur, &mut max) } {
-            Some((min, cur, max.max(min + 1)))
-        } else {
-            None
-        }
-    }
-
-    fn read_pair(&self, f: FnGetPair) -> Option<(u32, u32)> {
-        if !self.initialized.get() {
-            return None;
-        }
-        let (mut cur, mut max) = (0, 0);
-        if unsafe { f(&mut cur, &mut max) } {
-            Some((cur, max))
-        } else {
-            None
-        }
-    }
-
-    pub fn get_brightness(&self) -> Option<(u32, u32, u32)> {
-        self.read_range(self.get_brightness)
-    }
-
-    pub fn set_brightness(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_brightness)(value) }
-    }
-
-    pub fn set_contrast(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_contrast)(value) }
-    }
-
-    pub fn set_rgain(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_rgain)(value) }
-    }
-
-    pub fn set_ggain(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_ggain)(value) }
-    }
-
-    pub fn set_bgain(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_bgain)(value) }
-    }
-
-    pub fn set_bluelight(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_bluelight)(value) }
-    }
-
-    pub fn set_gamma(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_gamma)(value) }
-    }
-
-    pub fn set_colortemp(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_colortemp)(value) }
-    }
-
-    pub fn set_blackboost(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_blackboost)(value) }
-    }
-
-    pub fn set_volume(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_volume)(value) }
-    }
-
-    pub fn set_refresh_rate(&self, enabled: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_refreshrate)(u32::from(enabled)) }
-    }
-
-    pub fn set_od(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_od)(value) }
-    }
-
-    pub fn get_aim_type(&self) -> Option<u32> {
-        self.read_pair(self.get_aim_type).map(|x| x.0)
-    }
-
-    pub fn set_aim_type(&self, value: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_aim_type)(value) }
-    }
-
-    pub fn trigger_pixel_refresh(&self) -> bool {
-        self.initialized.get() && unsafe { (self.set_pixel_refresh)(1) }
-    }
-
-    pub fn set_pixel_shift(&self, enabled: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_pixel_shift)(u32::from(enabled)) }
-    }
-
-    pub fn set_logo_detection(&self, enabled: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_logo_detection)(u32::from(enabled)) }
-    }
-
-    pub fn set_static_image(&self, enabled: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_static_image)(u32::from(enabled)) }
-    }
-
-    pub fn set_ai_protection(&self, enabled: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_ai_protection)(u32::from(enabled)) }
-    }
-
-    pub fn read_oled_hw_state(&self) -> OledHwState {
-        OledHwState {
-            pixel_refresh_supported: self.read_pair(self.get_pixel_refresh).is_some(),
-            pixel_shift: self.read_pair(self.get_pixel_shift).map(|x| x.0 != 0),
-            logo_detection: self.read_pair(self.get_logo_detection).map(|x| x.0 != 0),
-            static_image: self.read_pair(self.get_static_image).map(|x| x.0 != 0),
-            ai_protection: self.read_pair(self.get_ai_protection).map(|x| x.0 != 0),
-        }
-    }
-
-    pub fn set_power_on(&self, on: bool) -> bool {
-        // 1 = Monitor_PowerOn, 5 = Monitor_PowerOff
-        self.initialized.get() && unsafe { (self.set_power_mode)(if on { 1 } else { 5 }) }
-    }
-
-    pub fn set_power_indicator(&self, on: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_power_indicator)(u32::from(on)) }
-    }
-
-    pub fn set_power_key_lock(&self, locked: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_power_key)(u32::from(locked)) }
-    }
-
-    pub fn set_key_lock(&self, locked: bool) -> bool {
-        self.initialized.get() && unsafe { (self.set_key_lock)(u32::from(locked)) }
-    }
-
-    pub fn set_usb_port(&self, port: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_usb_port)(port) }
     }
 
     pub fn get_vcp(&self, code: u8) -> Option<(u32, u32)> {
-        if !self.initialized.get() {
-            return None;
-        }
-        let (mut cur, mut max) = (0, 0);
-        if unsafe { (self.get_vcp_code)(code, &mut cur, &mut max) } {
+        let h = self.handle()?;
+        let (mut cur, mut max) = (0u32, 0u32);
+        let ok = unsafe {
+            GetVCPFeatureAndVCPFeatureReply(h, code, None, &mut cur, Some(&mut max))
+        };
+        if ok != 0 {
             Some((cur, max))
         } else {
             None
@@ -499,52 +300,222 @@ impl MccsSdk {
     }
 
     pub fn set_vcp(&self, code: u8, val: u32) -> bool {
-        self.initialized.get() && unsafe { (self.set_vcp_code)(code, val) }
+        let Some(h) = self.handle() else {
+            return false;
+        };
+        unsafe { SetVCPFeature(h, code, val) != 0 }
+    }
+
+    fn get_bank_vcp(&self, select_code: u8, sub: u32, data_code: u8) -> Option<(u32, u32)> {
+        if !self.set_vcp(select_code, sub) {
+            return None;
+        }
+        thread::sleep(BANK_DELAY);
+        self.get_vcp(data_code)
+    }
+
+    fn set_bank_vcp(&self, select_code: u8, sub: u32, data_code: u8, val: u32) -> bool {
+        if !self.set_vcp(select_code, sub) {
+            return false;
+        }
+        thread::sleep(BANK_DELAY);
+        self.set_vcp(data_code, val)
+    }
+
+    fn get_rgb_gain(&self, gain_type: MC_GAIN_TYPE) -> Option<(u32, u32, u32)> {
+        let h = self.handle()?;
+        let (mut min, mut cur, mut max) = (0u32, 0u32, 0u32);
+        if unsafe { GetMonitorRedGreenOrBlueGain(h, gain_type, &mut min, &mut cur, &mut max) } != 0
+        {
+            Some((min, cur, max.max(min + 1)))
+        } else {
+            None
+        }
+    }
+
+    fn set_rgb_gain(&self, gain_type: MC_GAIN_TYPE, value: u32) -> bool {
+        let Some(h) = self.handle() else {
+            return false;
+        };
+        unsafe { SetMonitorRedGreenOrBlueGain(h, gain_type, value) != 0 }
+    }
+
+    pub fn get_brightness(&self) -> Option<(u32, u32, u32)> {
+        let h = self.handle()?;
+        let (mut min, mut cur, mut max) = (0u32, 0u32, 0u32);
+        if unsafe { GetMonitorBrightness(h, &mut min, &mut cur, &mut max) } != 0 {
+            Some((min, cur, max.max(min + 1)))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_brightness(&self, value: u32) -> bool {
+        let Some(h) = self.handle() else {
+            return false;
+        };
+        unsafe { SetMonitorBrightness(h, value) != 0 }
+    }
+
+    pub fn get_contrast(&self) -> Option<(u32, u32, u32)> {
+        let h = self.handle()?;
+        let (mut min, mut cur, mut max) = (0u32, 0u32, 0u32);
+        if unsafe { GetMonitorContrast(h, &mut min, &mut cur, &mut max) } != 0 {
+            Some((min, cur, max.max(min + 1)))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_contrast(&self, value: u32) -> bool {
+        let Some(h) = self.handle() else {
+            return false;
+        };
+        unsafe { SetMonitorContrast(h, value) != 0 }
+    }
+
+    pub fn set_rgain(&self, value: u32) -> bool {
+        self.set_rgb_gain(MC_RED_GAIN, value)
+    }
+
+    pub fn set_ggain(&self, value: u32) -> bool {
+        self.set_rgb_gain(MC_GREEN_GAIN, value)
+    }
+
+    pub fn set_bgain(&self, value: u32) -> bool {
+        self.set_rgb_gain(MC_BLUE_GAIN, value)
+    }
+
+    pub fn set_bluelight(&self, value: u32) -> bool {
+        self.set_bank_vcp(0xE7, 0, 0xE8, value)
+    }
+
+    pub fn set_gamma(&self, value: u32) -> bool {
+        self.set_bank_vcp(0xE7, 1, 0xE8, value)
+    }
+
+    pub fn set_colortemp(&self, value: u32) -> bool {
+        self.set_bank_vcp(0xE7, 2, 0xE8, value)
+    }
+
+    pub fn set_blackboost(&self, value: u32) -> bool {
+        self.set_vcp(0xE5, value)
+    }
+
+    pub fn set_volume(&self, value: u32) -> bool {
+        self.set_vcp(0x62, value)
+    }
+
+    pub fn set_refresh_rate(&self, enabled: bool) -> bool {
+        self.set_bank_vcp(0xE0, 5, 0xE1, u32::from(enabled))
+    }
+
+    pub fn set_od(&self, value: u32) -> bool {
+        self.set_bank_vcp(0xE0, 4, 0xE1, value)
+    }
+
+    pub fn get_aim_type(&self) -> Option<u32> {
+        self.get_bank_vcp(0xE0, 6, 0xE1).map(|x| x.0)
+    }
+
+    pub fn set_aim_type(&self, value: u32) -> bool {
+        self.set_bank_vcp(0xE0, 6, 0xE1, value)
+    }
+
+    pub fn trigger_pixel_refresh(&self) -> bool {
+        self.set_bank_vcp(0xED, 0, 0xEE, 1)
+    }
+
+    pub fn set_pixel_shift(&self, enabled: bool) -> bool {
+        self.set_bank_vcp(0xED, 1, 0xEE, u32::from(enabled))
+    }
+
+    pub fn set_logo_detection(&self, enabled: bool) -> bool {
+        self.set_bank_vcp(0xED, 3, 0xEE, u32::from(enabled))
+    }
+
+    pub fn set_static_image(&self, enabled: bool) -> bool {
+        self.set_bank_vcp(0xED, 2, 0xEE, u32::from(enabled))
+    }
+
+    pub fn set_ai_protection(&self, enabled: bool) -> bool {
+        self.set_bank_vcp(0xED, 4, 0xEE, u32::from(enabled))
+    }
+
+    pub fn read_oled_hw_state(&self) -> OledHwState {
+        if !self.is_initialized() {
+            return OledHwState::default();
+        }
+        OledHwState {
+            pixel_refresh_supported: self.get_bank_vcp(0xED, 0, 0xEE).is_some(),
+            pixel_shift: self.get_bank_vcp(0xED, 1, 0xEE).map(|x| x.0 != 0),
+            logo_detection: self.get_bank_vcp(0xED, 3, 0xEE).map(|x| x.0 != 0),
+            static_image: self.get_bank_vcp(0xED, 2, 0xEE).map(|x| x.0 != 0),
+            ai_protection: self.get_bank_vcp(0xED, 4, 0xEE).map(|x| x.0 != 0),
+        }
+    }
+
+    pub fn set_power_on(&self, on: bool) -> bool {
+        // VCP 0xD6: 1 = Power On, 5 = Power Off
+        self.set_vcp(0xD6, if on { 1 } else { 5 })
+    }
+
+    pub fn set_power_indicator(&self, on: bool) -> bool {
+        self.set_bank_vcp(0xE0, 2, 0xE1, u32::from(on))
+    }
+
+    pub fn set_power_key_lock(&self, locked: bool) -> bool {
+        self.set_bank_vcp(0xE0, 1, 0xE1, u32::from(locked))
+    }
+
+    pub fn set_key_lock(&self, locked: bool) -> bool {
+        self.set_bank_vcp(0xE0, 0, 0xE1, u32::from(locked))
+    }
+
+    pub fn set_usb_port(&self, port: u32) -> bool {
+        self.set_bank_vcp(0xE7, 3, 0xE8, port)
     }
 
     pub fn read_system_hw_state(&self) -> SystemHwState {
-        if !self.initialized.get() {
+        let Some(h) = self.handle() else {
             return SystemHwState::default();
-        }
-        let vcp_str = unsafe {
-            let ptr = (self.get_vcp_string)();
-            if ptr.is_null() {
-                "Not Support".to_string()
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().into_owned()
-            }
         };
+        let mut cap_len = 0u32;
+        let caps_supported =
+            unsafe { GetCapabilitiesStringLength(h, &mut cap_len) != 0 } && cap_len > 1;
         let input_source = self.get_vcp(0x60).map(|x| x.0);
-        if vcp_str.contains("Not Support") {
+        if !caps_supported {
             return SystemHwState {
                 power_on: true,
                 power_indicator: None,
                 power_key_lock: None,
-                key_lock: self.read_pair(self.get_key_lock).map(|x| x.0 != 0),
+                key_lock: self.get_bank_vcp(0xE0, 0, 0xE1).map(|x| x.0 != 0),
                 usb_port: None,
                 input_source,
             };
         }
         SystemHwState {
             power_on: true,
-            power_indicator: self.read_pair(self.get_power_indicator).map(|x| x.0 != 0),
-            power_key_lock: self.read_pair(self.get_power_key).map(|x| x.0 != 0),
-            key_lock: self.read_pair(self.get_key_lock).map(|x| x.0 != 0),
-            usb_port: self.read_pair(self.get_usb_port).map(|x| x.0),
+            power_indicator: self.get_bank_vcp(0xE0, 2, 0xE1).map(|x| x.0 != 0),
+            power_key_lock: self.get_bank_vcp(0xE0, 1, 0xE1).map(|x| x.0 != 0),
+            key_lock: self.get_bank_vcp(0xE0, 0, 0xE1).map(|x| x.0 != 0),
+            usb_port: self.get_bank_vcp(0xE7, 3, 0xE8).map(|x| x.0),
             input_source,
         }
     }
 
     pub fn read_serial_number(&self) -> Option<String> {
-        if !self.initialized.get() {
+        if !self.set_vcp(0xE0, 3) {
             return None;
         }
+        thread::sleep(Duration::from_millis(40));
         let mut bytes = Vec::with_capacity(24);
-        for read_num in 0..6 {
-            let (mut cur, mut max) = (0u32, 0u32);
-            if !unsafe { (self.get_sn)(&mut cur, &mut max, read_num, 40) } {
+        for read_num in 0..6u32 {
+            if !self.set_vcp(0xE1, read_num) {
                 return None;
             }
+            thread::sleep(Duration::from_millis(40));
+            let (cur, _) = self.get_vcp(0xE1)?;
             for b in cur.to_be_bytes() {
                 if b.is_ascii_alphanumeric() {
                     bytes.push(b);
@@ -560,7 +531,7 @@ impl MccsSdk {
     }
 
     pub fn read_custom_settings(&self) -> CustomSettings {
-        if !self.initialized.get() {
+        if !self.is_initialized() {
             return CustomSettings::default();
         }
         let mut sat_6 = [50u32; 6];
@@ -594,40 +565,41 @@ impl MccsSdk {
     }
 
     pub fn read_basic_settings(&self, current: &CustomSettings) -> CustomSettings {
-        if !self.initialized.get() {
+        if !self.is_initialized() {
             return current.clone();
         }
         CustomSettings {
             brightness: self.get_brightness().unwrap_or((0, 50, 100)),
-            contrast: self.read_range(self.get_contrast).unwrap_or((0, 50, 100)),
-            r_gain: self.read_range(self.get_rgain).unwrap_or((0, 50, 100)),
-            g_gain: self.read_range(self.get_ggain).unwrap_or((0, 50, 100)),
-            b_gain: self.read_range(self.get_bgain).unwrap_or((0, 50, 100)),
+            contrast: self.get_contrast().unwrap_or((0, 50, 100)),
+            r_gain: self.get_rgb_gain(MC_RED_GAIN).unwrap_or((0, 50, 100)),
+            g_gain: self.get_rgb_gain(MC_GREEN_GAIN).unwrap_or((0, 50, 100)),
+            b_gain: self.get_rgb_gain(MC_BLUE_GAIN).unwrap_or((0, 50, 100)),
             r_black: current.r_black,
             g_black: current.g_black,
             b_black: current.b_black,
             sharpness: current.sharpness,
             sat_6: current.sat_6,
             hue_6: current.hue_6,
-            blue_light: self.read_pair(self.get_bluelight).map(|x| x.0).unwrap_or(0),
-            gamma: self.read_pair(self.get_gamma).map(|x| x.0).unwrap_or(0),
-            color_temp: self.read_pair(self.get_colortemp).map(|x| x.0).unwrap_or(1),
-            black_boost: self.read_pair(self.get_blackboost).unwrap_or((0, 10)),
-            volume: self.read_pair(self.get_volume).unwrap_or((50, 100)),
-            refresh_rate: self.read_pair(self.get_refreshrate)
+            blue_light: self.get_bank_vcp(0xE7, 0, 0xE8).map(|x| x.0).unwrap_or(0),
+            gamma: self.get_bank_vcp(0xE7, 1, 0xE8).map(|x| x.0).unwrap_or(0),
+            color_temp: self.get_bank_vcp(0xE7, 2, 0xE8).map(|x| x.0).unwrap_or(1),
+            black_boost: self.get_vcp(0xE5).unwrap_or((0, 10)),
+            volume: self.get_vcp(0x62).unwrap_or((50, 100)),
+            refresh_rate: self
+                .get_bank_vcp(0xE0, 5, 0xE1)
                 .map(|x| x.0 != 0)
                 .unwrap_or(false),
-            od: self.read_pair(self.get_od).map(|x| x.0).unwrap_or(0),
-            aim_type: self.read_pair(self.get_aim_type).map(|x| x.0).unwrap_or(0),
+            od: self.get_bank_vcp(0xE0, 4, 0xE1).map(|x| x.0).unwrap_or(0),
+            aim_type: self.get_aim_type().unwrap_or(0),
         }
     }
 
     pub fn get_display_mode(&self) -> Option<u32> {
-        self.read_pair(self.get_display_mode).map(|x| x.0)
+        self.get_vcp(0xE2).map(|x| x.0)
     }
 
     pub fn set_display_mode(&self, mode: DisplayMode) -> bool {
-        self.initialized.get() && unsafe { (self.set_display_mode)(mode as u32) }
+        self.set_vcp(0xE2, mode as u32)
     }
 }
 

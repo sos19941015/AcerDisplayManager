@@ -106,19 +106,10 @@ fn spawn_worker(ctx: egui::Context) -> (Sender<WorkerCmd>, Receiver<WorkerEvent>
     let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
 
     thread::spawn(move || {
-        let sdk = match MccsSdk::find_and_load() {
-            Ok((sdk, path)) => {
-                let _ = evt_tx.send(WorkerEvent::SdkLoaded(Ok(format!(
-                    "已載入 {}",
-                    path.display()
-                ))));
-                Some(sdk)
-            }
-            Err(err) => {
-                let _ = evt_tx.send(WorkerEvent::SdkLoaded(Err(err)));
-                None
-            }
-        };
+        let sdk = MccsSdk::new();
+        let _ = evt_tx.send(WorkerEvent::SdkLoaded(Ok(
+            "使用 Windows 原生 DDC/CI (dxva2.dll)".to_string(),
+        )));
         ctx.request_repaint();
 
         let query_state = |sdk: &MccsSdk| -> (Option<(u32, u32, u32)>, Option<DisplayMode>) {
@@ -147,9 +138,7 @@ fn spawn_worker(ctx: egui::Context) -> (Sender<WorkerCmd>, Receiver<WorkerEvent>
         let mut cached_custom = CustomSettings::default();
 
         while let Ok(cmd) = cmd_rx.recv() {
-            let Some(sdk) = sdk.as_ref() else {
-                continue;
-            };
+            let sdk = &sdk;
             match cmd {
                 WorkerCmd::InitMonitor(info) => {
                     current_display = Some(info.clone());

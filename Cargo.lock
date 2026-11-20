@@ -113,7 +113,6 @@ name = "acer-display-rust"
 version = "0.1.0"
 dependencies = [
  "eframe",
- "libloading 0.8.9",
  "tray-icon",
  "windows 0.58.0",
 ]
