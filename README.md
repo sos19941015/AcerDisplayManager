@@ -30,6 +30,10 @@ cargo run
 cargo build --release
 ```
 
+## 技術文件
+
+- [Acer 螢幕 DDC/CI (VCP) 通訊協定說明 (ACER_VCP_PROTOCOL.md)](./ACER_VCP_PROTOCOL.md) — 完整整理標準 VCP 與 Acer `0xE0/0xE1`、`0xE7/0xE8`、`0xED/0xEE` 分頁切換協定及實測韌體細節。
+
 ## 免責聲明
 
 本專案為社群開源工具，與 Acer Inc. 無任何官方關聯。所有 Acer 商標均歸其各自擁有者所有。
