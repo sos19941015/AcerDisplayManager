@@ -12,15 +12,17 @@ use mccs::{
     SystemHwState, VCP_HUE, VCP_RGB_BLACK, VCP_SAT, VCP_SHARPNESS,
 };
 use profiles::{load_profiles, save_profiles, CustomProfile};
-use tray::{TrayAction, TrayManager};
-use win_oled::{
-    get_auto_hdr, get_display_resolution, get_monitor_edid_info, get_startup_enabled,
-    read_win_oled_state, set_auto_hdr, set_dark_mode, set_screensaver, set_startup_enabled,
-    set_taskbar_autohide, set_transparency, set_windows_hdr, WinOledState,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tray::TrayManager;
+use win_oled::{
+    get_auto_hdr, get_display_resolution, get_monitor_edid_info, get_startup_enabled,
+    open_power_sleep_settings, read_win_oled_state, set_auto_hdr, set_dark_mode, set_screensaver,
+    set_startup_enabled, set_taskbar_autohide, set_transparency, set_windows_hdr, WinOledState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -565,8 +567,7 @@ struct DisplayWidgetApp {
     burnin_start: Option<Instant>,
     focus_mode: bool,
     tray: Option<TrayManager>,
-    window_visible: bool,
-    quitting: bool,
+    quitting: Arc<AtomicBool>,
     profiles: Vec<CustomProfile>,
     active_profile: Option<usize>,
     new_profile_name: String,
@@ -601,7 +602,8 @@ impl DisplayWidgetApp {
             ("未知".to_string(), "未知".to_string(), "未知".to_string())
         };
 
-        let tray = TrayManager::new(cc.egui_ctx.clone()).ok();
+        let quitting = Arc::new(AtomicBool::new(false));
+        let tray = TrayManager::new(cc.egui_ctx.clone(), quitting.clone()).ok();
 
         let start_minimized = std::env::args().any(|a| a == "--minimized");
         if start_minimized {
@@ -633,8 +635,7 @@ impl DisplayWidgetApp {
             burnin_start: None,
             focus_mode: false,
             tray,
-            window_visible: !start_minimized,
-            quitting: false,
+            quitting,
             profiles: load_profiles(),
             active_profile: None,
             new_profile_name: String::new(),
@@ -1594,6 +1595,24 @@ impl DisplayWidgetApp {
                     );
                 }
 
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("螢幕休眠設定 (電源與睡眠)")
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(230, 234, 240)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("開啟設定 ↗").clicked() {
+                            if open_power_sleep_settings() {
+                                self.status = "已開啟 Windows 電源與睡眠設定".to_string();
+                            } else {
+                                self.status = "無法開啟 Windows 電源與睡眠設定".to_string();
+                            }
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
                 ui.add_space(4.0);
                 let input_supported = self.connected && self.sys_hw.input_source.is_some();
                 let mut in_val = self.sys_hw.input_source.unwrap_or(15);
@@ -1877,29 +1896,12 @@ impl DisplayWidgetApp {
 
 impl eframe::App for DisplayWidgetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(action) = self.tray.as_ref().and_then(|t| t.poll()) {
-            match action {
-                TrayAction::ToggleWindow => {
-                    self.window_visible = !self.window_visible;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
-                    if self.window_visible {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                }
-                TrayAction::Quit => {
-                    self.quitting = true;
-                    self.tray = None;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
-                }
-            }
-        }
-
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting.load(Ordering::SeqCst)
+            && self.tray.is_some()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.window_visible = false;
         }
 
         self.poll_events();
@@ -2008,11 +2010,17 @@ fn setup_theme(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    let (rgba, width, height) = tray::app_icon_rgba();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([380.0, 660.0])
             .with_resizable(false)
-            .with_title("Acer Display Widget (Rust)"),
+            .with_title("Acer Display Widget (Rust)")
+            .with_icon(egui::IconData {
+                rgba,
+                width,
+                height,
+            }),
         ..Default::default()
     };
 

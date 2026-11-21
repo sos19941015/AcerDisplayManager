@@ -19,11 +19,13 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD, REG_SZ,
     REG_VALUE_TYPE,
 };
-use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA};
+use windows::Win32::UI::Shell::{
+    SHAppBarMessage, ShellExecuteW, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageTimeoutW, SystemParametersInfoW, HWND_BROADCAST, SMTO_ABORTIFHUNG,
     SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_GETSCREENSAVEACTIVE, SPI_SETSCREENSAVEACTIVE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE,
+    SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE,
 };
 
 const PERSONALIZE_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
@@ -479,4 +481,18 @@ pub fn set_windows_hdr(device_name: &str, enable: bool) -> Result<bool, String> 
     }
 
     Err(format!("找不到對應的顯示路徑: {device_name}"))
+}
+
+pub fn open_power_sleep_settings() -> bool {
+    let rc = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            w!("open"),
+            w!("ms-settings:powersleep"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    (rc.0 as isize) > 32
 }
