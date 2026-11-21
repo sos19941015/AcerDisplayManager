@@ -1901,7 +1901,7 @@ impl eframe::App for DisplayWidgetApp {
             && self.tray.is_some()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            tray::hide_main_window();
         }
 
         self.poll_events();

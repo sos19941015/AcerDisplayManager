@@ -24,6 +24,14 @@ fn find_main_hwnd() -> Option<HWND> {
     }
 }
 
+pub fn hide_main_window() {
+    if let Some(hwnd) = find_main_hwnd() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
 fn toggle_main_window(ctx: &egui::Context) {
     if let Some(hwnd) = find_main_hwnd() {
         unsafe {
