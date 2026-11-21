@@ -1,4 +1,7 @@
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use eframe::egui;
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub enum TrayAction {
@@ -8,12 +11,11 @@ pub enum TrayAction {
 
 pub struct TrayManager {
     _tray: TrayIcon,
-    toggle_id: MenuId,
-    quit_id: MenuId,
+    rx: Receiver<TrayAction>,
 }
 
 impl TrayManager {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(ctx: egui::Context) -> Result<Self, String> {
         let menu = Menu::new();
         let toggle_item = MenuItem::new("顯示 / 隱藏視窗", true, None);
         let quit_item = MenuItem::new("結束程式", true, None);
@@ -31,33 +33,42 @@ impl TrayManager {
             .build()
             .map_err(|e| e.to_string())?;
 
-        Ok(Self {
-            _tray: tray,
-            toggle_id,
-            quit_id,
-        })
-    }
+        let (tx, rx) = mpsc::channel::<TrayAction>();
 
-    pub fn poll(&self) -> Option<TrayAction> {
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+        let tx_icon = tx.clone();
+        let ctx_icon = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |ev| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
             } = ev
             {
-                return Some(TrayAction::ToggleWindow);
+                let _ = tx_icon.send(TrayAction::ToggleWindow);
+                ctx_icon.request_repaint();
             }
-        }
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.toggle_id {
-                return Some(TrayAction::ToggleWindow);
+        }));
+
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            if ev.id == toggle_id {
+                let _ = tx.send(TrayAction::ToggleWindow);
+                ctx.request_repaint();
+            } else if ev.id == quit_id {
+                let _ = tx.send(TrayAction::Quit);
+                ctx.request_repaint();
+                // 若視窗隱藏導致 eframe 暫停喚醒 update()，確保 350ms 後仍能確實結束程式
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(350));
+                    std::process::exit(0);
+                });
             }
-            if ev.id == self.quit_id {
-                return Some(TrayAction::Quit);
-            }
-        }
-        None
+        }));
+
+        Ok(Self { _tray: tray, rx })
+    }
+
+    pub fn poll(&self) -> Option<TrayAction> {
+        self.rx.try_recv().ok()
     }
 }
 

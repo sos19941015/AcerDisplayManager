@@ -601,15 +601,7 @@ impl DisplayWidgetApp {
             ("未知".to_string(), "未知".to_string(), "未知".to_string())
         };
 
-        let tray = TrayManager::new().ok();
-        let repaint_ctx_1 = cc.egui_ctx.clone();
-        tray_icon::TrayIconEvent::set_event_handler(Some(move |_| {
-            repaint_ctx_1.request_repaint();
-        }));
-        let repaint_ctx_2 = cc.egui_ctx.clone();
-        tray_icon::menu::MenuEvent::set_event_handler(Some(move |_| {
-            repaint_ctx_2.request_repaint();
-        }));
+        let tray = TrayManager::new(cc.egui_ctx.clone()).ok();
 
         let start_minimized = std::env::args().any(|a| a == "--minimized");
         if start_minimized {
@@ -1885,20 +1877,21 @@ impl DisplayWidgetApp {
 
 impl eframe::App for DisplayWidgetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(tray) = &self.tray {
-            if let Some(action) = tray.poll() {
-                match action {
-                    TrayAction::ToggleWindow => {
-                        self.window_visible = !self.window_visible;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
-                        if self.window_visible {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        }
+        if let Some(action) = self.tray.as_ref().and_then(|t| t.poll()) {
+            match action {
+                TrayAction::ToggleWindow => {
+                    self.window_visible = !self.window_visible;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+                    if self.window_visible {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
-                    TrayAction::Quit => {
-                        self.quitting = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                }
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    self.tray = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
                 }
             }
         }
